@@ -11,6 +11,7 @@
 *.ilk
 *.map
 *.exp
+*.ld
 
 # Precompiled Headers
 *.gch
@@ -53,3 +54,31 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build artifacts
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.o
+*.d
+
+# Toolchain / IDE specific
+.metadata/
+.settings/
+.launch
+bin/
+obj/
+
+# CubeMX auto-generated (Optional: keep if you want to track config)
+.mxproject
+.cproject
+.project
+
+# OS specific
+Thumbs.db
+.DS_Store
