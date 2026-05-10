@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <string.h>
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -31,7 +33,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define BMP280_ADDR (0x76 << 1)
+#define BMP280_CALIBRATION_LSB_REGISTER 0x88
+#define BMP280_PRESSURE_MSB_REGISTER 0xF7
+#define BMP280_TEMPERATURE_MSB_REGISTER 0xFA
+#define BMP280_CONTROL_REGISTER 0xF4
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -40,6 +46,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -50,13 +58,113 @@ UART_HandleTypeDef huart2;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+typedef struct
+{
+	uint16_t dig_T1;
+	int16_t dig_T2;
+	int16_t dig_T3;
+	uint16_t dig_P1;
+	int16_t dig_P2;
+	int16_t dig_P3;
+	int16_t dig_P4;
+	int16_t dig_P5;
+	int16_t dig_P6;
+	int16_t dig_P7;
+	int16_t dig_P8;
+	int16_t dig_P9;
+} BMP280_Calibration_Data;
 
+BMP280_Calibration_Data BMP280_Calibrate(void)
+{
+	uint8_t reg = BMP280_CALIBRATION_LSB_REGISTER;
+	uint8_t raw_data[24];
+	BMP280_Calibration_Data calib;
+
+	HAL_I2C_Master_Transmit(&hi2c1, BMP280_ADDR, &reg, 1, HAL_MAX_DELAY);
+	HAL_I2C_Master_Receive(&hi2c1, BMP280_ADDR, raw_data, 24, HAL_MAX_DELAY);
+
+	// Format data according to BMP280 Datasheet
+	calib.dig_T1 = (uint16_t) (raw_data[1] << 8) | raw_data[0];
+	calib.dig_T2 = (int16_t) (raw_data[3] << 8) | raw_data[2];
+	calib.dig_T3 = (int16_t) (raw_data[5] << 8) | raw_data[4];
+	calib.dig_P1 = (uint16_t) (raw_data[7] << 8) | raw_data[6];
+	calib.dig_P2 = (int16_t) (raw_data[9] << 8) | raw_data[8];
+	calib.dig_P3 = (int16_t) (raw_data[11] << 8) | raw_data[10];
+	calib.dig_P4 = (int16_t) (raw_data[13] << 8) | raw_data[12];
+	calib.dig_P5 = (int16_t) (raw_data[15] << 8) | raw_data[14];
+	calib.dig_P6 = (int16_t) (raw_data[17] << 8) | raw_data[16];
+	calib.dig_P7 = (int16_t) (raw_data[19] << 8) | raw_data[18];
+	calib.dig_P8 = (int16_t) (raw_data[21] << 8) | raw_data[20];
+	calib.dig_P9 = (int16_t) (raw_data[23] << 8) | raw_data[22];
+
+	char msg[50] = "Calibration Complete!";
+	HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+	return calib;
+}
+
+int32_t BMP280_CompensateTemp(BMP280_Calibration_Data* calib, int32_t* t_fine, int32_t adc_t)
+{
+	int32_t var1, var2, T;
+	var1 = ((((adc_t >> 3) - ((int32_t)calib->dig_T1 << 1))) * ((int32_t)calib->dig_T2)) >> 11;
+	var2 = (((((adc_t >> 4) - ((int32_t)calib->dig_T1)) * ((adc_t >> 4) - ((int32_t)calib->dig_T1))) >> 12) * ((int32_t)calib->dig_T3)) >> 14;
+
+	*t_fine = var1 + var2;
+
+	T = (*t_fine * 5 + 128) >> 8;
+
+
+	return T;
+}
+
+uint32_t BMP280_CompensatePressure(BMP280_Calibration_Data* calib, int32_t* t_fine, int32_t adc_p)
+{
+	// Conversion from datasheet
+	int64_t var1, var2, p;
+	var1 = ((int64_t)*t_fine) - 128000;
+	var2 = var1 * var1 * (int64_t)calib->dig_P6;
+	var2 = var2 + ((var1 * (int64_t)calib->dig_P5) << 17);
+	var2 = var2 + (((int64_t)calib->dig_P4) << 35);
+	var1 = ((var1 * var1 * (int64_t)calib->dig_P3) >> 8) + ((var1 * (int64_t)calib->dig_P2) << 12);
+	var1 = (((((int64_t)1) << 47) + var1)) * ((int64_t)calib->dig_P1) >> 33;
+
+	if(var1 == 0)
+	{
+		return 0;
+	}
+
+    p = 1048576 - adc_p;
+    p = (((p << 31) - var2) * 3125) / var1;
+    var1 = (((int64_t)calib->dig_P9) * (p >> 13) * (p >> 13)) >> 25;
+    var2 = (((int64_t)calib->dig_P8) * p) >> 19;
+    p = ((p + var1 + var2) >> 8) + (((int64_t)calib->dig_P7) << 4);
+
+    return (uint32_t)p;
+}
+
+void BMP280_ReadData(BMP280_Calibration_Data* calib, int32_t* t_fine, float* temperature, float* pressure)
+{
+	uint8_t reg = BMP280_PRESSURE_MSB_REGISTER;
+	uint8_t data[6];
+
+	HAL_I2C_Master_Transmit(&hi2c1, BMP280_ADDR, &reg, 1, HAL_MAX_DELAY);
+	HAL_I2C_Master_Receive(&hi2c1, BMP280_ADDR, data, 6, HAL_MAX_DELAY);
+
+	int32_t adc_t = (int32_t)(((uint32_t)data[3] << 12) | ((uint32_t)data[4] << 4) | ((uint32_t)data[5] >> 4));
+	int32_t raw_temp = BMP280_CompensateTemp(calib, t_fine, adc_t);
+	*temperature = (float)raw_temp / 100.0f;
+
+	int32_t adc_p = (int32_t)(((uint32_t)data[0] << 12) | ((uint32_t)data[1] << 4) | ((uint32_t)data[2] >> 4));
+	uint32_t raw_pressure = BMP280_CompensatePressure(calib, t_fine, adc_p);
+	*pressure = (float)raw_pressure / 25600.0f;
+}
 /* USER CODE END 0 */
 
 /**
@@ -89,7 +197,23 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  uint8_t who_am_i = 0;
+  uint8_t id_register = 0xD0;
+
+  HAL_I2C_Master_Transmit(&hi2c1, 0x76 << 1, &id_register, 1, HAL_MAX_DELAY);
+  HAL_I2C_Master_Receive(&hi2c1, 0x76 << 1, &who_am_i, 1, HAL_MAX_DELAY);
+
+  char id_msg[40];
+  sprintf(id_msg, "BMP280 Chip ID: 0x%02X\r\n", who_am_i);
+  HAL_UART_Transmit(&huart2, (uint8_t*)id_msg, strlen(id_msg), HAL_MAX_DELAY);
+
+  // Configure BMP280 into normal mode
+  uint8_t configuration[2] = {BMP280_CONTROL_REGISTER, 0x27};
+  HAL_I2C_Master_Transmit(&hi2c1, BMP280_ADDR, configuration, 2, HAL_MAX_DELAY);
+  BMP280_Calibration_Data calib_data = BMP280_Calibrate();
+  int32_t t_fine = 0;
 
   /* USER CODE END 2 */
 
@@ -98,8 +222,16 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-	HAL_Delay(500);
+	// BMP280 Read Temperature
+	float temperature = 0.0f;
+	float pressure = 0.0f;
+	BMP280_ReadData(&calib_data, &t_fine, &temperature, &pressure);
+	char msg[60];
+	sprintf(msg, "Temp: %.2f C | Pressure: %.2f hPa\r\n", temperature, pressure);
+	HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+	HAL_Delay(1000);
+
+
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -150,6 +282,40 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
 }
 
 /**
